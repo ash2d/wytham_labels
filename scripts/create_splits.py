@@ -195,67 +195,97 @@ def load_embeddings_for_clips(
     df: pl.DataFrame,
     embedding_col: str = "embedding_path",
     clip_id_col: str = "clip_id",
-    chunk_idx_col: str = "chunk_idx"
+    chunk_idx_col: str = "chunk_idx",
+    max_files: int = 50,
+    sample_per_file: int = 500
 ) -> Dict[str, np.ndarray]:
     """
     Load embeddings for clips from their embedding files.
     
     Returns dict mapping clip_id -> embedding vector.
     
-    Embeddings are stored in parquet files with one row per chunk_idx.
+    For efficiency, limits the number of files loaded and samples clips per file.
+    This is a best-effort loading for diversity sampling - if we can't load all,
+    we fall back to random selection for the rest.
     """
     embeddings = {}
     
     # Group clips by embedding_path to minimize file reads
-    paths = df.select(embedding_col).unique().to_series().to_list()
+    paths_with_counts = (
+        df.group_by(embedding_col)
+        .agg([
+            pl.col(clip_id_col).alias("clip_ids"),
+            pl.col(chunk_idx_col).alias("chunk_indices"),
+            pl.len().alias("count")
+        ])
+        .sort("count", descending=True)
+        .head(max_files)  # Limit number of files to load
+    )
     
-    for path in paths:
-        if not path or not Path(path).exists():
+    total_paths = len(paths_with_counts)
+    logger.info(f"Loading embeddings from up to {total_paths} files...")
+    
+    for i, row in enumerate(paths_with_counts.iter_rows(named=True)):
+        path = row[embedding_col]
+        clip_ids = row["clip_ids"]
+        chunk_indices = row["chunk_indices"]
+        
+        if not path:
+            continue
+            
+        path_obj = Path(path)
+        if not path_obj.exists():
+            logger.debug(f"Embedding file not found: {path}")
             continue
         
         try:
-            # Load embedding parquet
+            # Load embedding parquet - only load needed columns
             emb_df = pl.read_parquet(path)
             
-            # Get clips that reference this file
-            clips_for_path = df.filter(pl.col(embedding_col) == path)
+            # Identify embedding columns (numeric columns starting with 'emb' or all float columns)
+            emb_cols = [c for c in emb_df.columns if c.startswith('emb')]
+            if not emb_cols:
+                # Fallback: use all float columns except metadata
+                metadata_cols = {'file', 'file_path', 'chunk_idx', 'start_time', 'end_time'}
+                emb_cols = [c for c in emb_df.columns 
+                           if c not in metadata_cols and emb_df[c].dtype in [pl.Float32, pl.Float64]]
             
-            for row in clips_for_path.iter_rows(named=True):
-                clip_id = row[clip_id_col]
-                chunk_idx = row[chunk_idx_col]
+            if not emb_cols:
+                logger.warning(f"No embedding columns found in {path}")
+                continue
+            
+            # Sample clips if too many
+            indices_to_load = list(zip(clip_ids, chunk_indices))
+            if len(indices_to_load) > sample_per_file:
+                indices_to_load = indices_to_load[:sample_per_file]
+            
+            # Build lookup by chunk_idx for efficiency
+            if 'chunk_idx' in emb_df.columns:
+                # Convert to dict for O(1) lookup
+                chunk_to_row = {}
+                for j, chunk_idx in enumerate(emb_df['chunk_idx'].to_list()):
+                    chunk_to_row[chunk_idx] = j
                 
-                # Find the row in embedding file matching chunk_idx
-                # Assuming embedding file has 'chunk_idx' or is indexed by row number
-                if 'chunk_idx' in emb_df.columns:
-                    emb_row = emb_df.filter(pl.col('chunk_idx') == chunk_idx)
-                else:
-                    # Assume row index matches chunk_idx
+                for clip_id, chunk_idx in indices_to_load:
+                    if chunk_idx in chunk_to_row:
+                        row_idx = chunk_to_row[chunk_idx]
+                        emb = emb_df[row_idx, emb_cols].to_numpy().flatten()
+                        embeddings[clip_id] = emb
+            else:
+                # Assume row index = chunk_idx
+                for clip_id, chunk_idx in indices_to_load:
                     if chunk_idx < len(emb_df):
-                        emb_row = emb_df.slice(chunk_idx, 1)
-                    else:
-                        continue
-                
-                if emb_row.is_empty():
-                    continue
-                
-                # Extract embedding - assume it's either a list column or multiple numeric columns
-                if 'embedding' in emb_row.columns:
-                    emb = np.array(emb_row['embedding'][0])
-                else:
-                    # Assume all numeric columns form the embedding
-                    numeric_cols = [c for c in emb_row.columns 
-                                   if emb_row[c].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]]
-                    if numeric_cols:
-                        emb = emb_row.select(numeric_cols).to_numpy().flatten()
-                    else:
-                        continue
-                
-                embeddings[clip_id] = emb
+                        emb = emb_df[chunk_idx, emb_cols].to_numpy().flatten()
+                        embeddings[clip_id] = emb
+            
+            if (i + 1) % 10 == 0:
+                logger.info(f"Loaded embeddings from {i + 1}/{total_paths} files ({len(embeddings)} clips so far)")
                 
         except Exception as e:
             logger.warning(f"Failed to load embeddings from {path}: {e}")
             continue
     
+    logger.info(f"Successfully loaded {len(embeddings)} embeddings")
     return embeddings
 
 
@@ -527,18 +557,26 @@ def select_temporal_test(
 def select_diversity(
     df: pl.DataFrame,
     rng: np.random.Generator,
-    existing_clip_ids: Set[str]
+    existing_clip_ids: Set[str],
+    use_embeddings: bool = True
 ) -> pl.DataFrame:
     """
     Select 1400 diversity-based training clips via k-means medoids.
     
     Stratify by (month × session), where session = dawn/dusk.
     100 clips per stratum.
+    
+    If use_embeddings=False or embedding loading fails, falls back to random selection.
     """
     logger.info("Selecting diversity-based training clips...")
     
     # Exclude already selected clips
     df = df.filter(~pl.col("clip_id").is_in(existing_clip_ids))
+    logger.info(f"Clips available for diversity selection: {len(df)}")
+    
+    if df.is_empty():
+        logger.error("No clips available for diversity selection!")
+        return pl.DataFrame()
     
     # Add session column
     df = df.with_columns(
@@ -552,25 +590,73 @@ def select_diversity(
     strata = df.group_by(["month", "session"]).agg(pl.len().alias("count"))
     logger.info(f"Strata counts:\n{strata}")
     
+    if strata.is_empty():
+        logger.error("No strata found!")
+        return pl.DataFrame()
+    
     all_selected = []
     existing_minute_keys: Set[str] = set()
     existing_site_day_times: Dict[Tuple[str, str], List[float]] = {}
     
-    for row in strata.iter_rows(named=True):
+    for stratum_idx, row in enumerate(strata.iter_rows(named=True)):
         month, session = row['month'], row['session']
         stratum_df = df.filter(
             (pl.col("month") == month) & (pl.col("session") == session)
         )
         
-        logger.info(f"Stratum ({month}, {session}): {len(stratum_df)} clips available")
+        logger.info(f"Stratum {stratum_idx + 1}/{len(strata)} ({month}, {session}): {len(stratum_df)} clips available")
         
-        # Load embeddings for this stratum
-        embeddings = load_embeddings_for_clips(stratum_df)
-        logger.info(f"Loaded {len(embeddings)} embeddings for stratum")
+        # Decide whether to use embeddings or random selection
+        use_kmeans = use_embeddings and len(stratum_df) >= CLIPS_PER_STRATUM_DIVERSITY
         
-        if len(embeddings) < CLIPS_PER_STRATUM_DIVERSITY:
-            # Not enough embeddings, fall back to random selection
-            logger.warning(f"Insufficient embeddings, using random selection")
+        if use_kmeans:
+            logger.info(f"Attempting k-means medoid selection...")
+            try:
+                # Load embeddings for this stratum (with limits for efficiency)
+                embeddings = load_embeddings_for_clips(stratum_df, max_files=30, sample_per_file=300)
+                
+                if len(embeddings) < CLIPS_PER_STRATUM_DIVERSITY:
+                    logger.warning(f"Only {len(embeddings)} embeddings loaded, need {CLIPS_PER_STRATUM_DIVERSITY}. Falling back to random selection.")
+                    use_kmeans = False
+                else:
+                    # K-means clustering and medoid selection
+                    clip_ids = stratum_df.select("clip_id").to_series().to_list()
+                    logger.info(f"Running k-means with {len(embeddings)} embeddings...")
+                    medoid_ids = compute_medoids(embeddings, clip_ids, CLIPS_PER_STRATUM_DIVERSITY)
+                    logger.info(f"K-means returned {len(medoid_ids)} medoids")
+                    
+                    # Filter medoids through constraints
+                    medoid_df = stratum_df.filter(pl.col("clip_id").is_in(medoid_ids))
+                    selected = filter_with_constraints(
+                        medoid_df,
+                        CLIPS_PER_STRATUM_DIVERSITY,
+                        rng,
+                        existing_minute_keys,
+                        existing_site_day_times,
+                        max_per_site=MAX_CLIPS_PER_SITE_DIVERSITY
+                    )
+                    
+                    # If we didn't get enough from medoids, supplement with random
+                    if len(selected) < CLIPS_PER_STRATUM_DIVERSITY:
+                        logger.info(f"Got {len(selected)} from medoids, supplementing with random...")
+                        remaining_df = stratum_df.filter(~pl.col("clip_id").is_in(selected["clip_id"]))
+                        supplement = filter_with_constraints(
+                            remaining_df,
+                            CLIPS_PER_STRATUM_DIVERSITY - len(selected),
+                            rng,
+                            existing_minute_keys,
+                            existing_site_day_times,
+                            max_per_site=MAX_CLIPS_PER_SITE_DIVERSITY
+                        )
+                        if not supplement.is_empty():
+                            selected = pl.concat([selected, supplement])
+            except Exception as e:
+                logger.warning(f"K-means selection failed: {e}. Falling back to random selection.")
+                use_kmeans = False
+        
+        if not use_kmeans:
+            # Random selection with constraints
+            logger.info(f"Using random selection for stratum ({month}, {session})")
             selected = filter_with_constraints(
                 stratum_df,
                 CLIPS_PER_STRATUM_DIVERSITY,
@@ -579,35 +665,6 @@ def select_diversity(
                 existing_site_day_times,
                 max_per_site=MAX_CLIPS_PER_SITE_DIVERSITY
             )
-        else:
-            # K-means clustering and medoid selection
-            clip_ids = stratum_df.select("clip_id").to_series().to_list()
-            medoid_ids = compute_medoids(embeddings, clip_ids, CLIPS_PER_STRATUM_DIVERSITY)
-            
-            # Filter medoids through constraints
-            medoid_df = stratum_df.filter(pl.col("clip_id").is_in(medoid_ids))
-            selected = filter_with_constraints(
-                medoid_df,
-                CLIPS_PER_STRATUM_DIVERSITY,
-                rng,
-                existing_minute_keys,
-                existing_site_day_times,
-                max_per_site=MAX_CLIPS_PER_SITE_DIVERSITY
-            )
-            
-            # If we didn't get enough from medoids, supplement with random
-            if len(selected) < CLIPS_PER_STRATUM_DIVERSITY:
-                remaining_df = stratum_df.filter(~pl.col("clip_id").is_in(selected["clip_id"]))
-                supplement = filter_with_constraints(
-                    remaining_df,
-                    CLIPS_PER_STRATUM_DIVERSITY - len(selected),
-                    rng,
-                    existing_minute_keys,
-                    existing_site_day_times,
-                    max_per_site=MAX_CLIPS_PER_SITE_DIVERSITY
-                )
-                if not supplement.is_empty():
-                    selected = pl.concat([selected, supplement])
         
         # Update tracking
         for row in selected.iter_rows(named=True):
@@ -632,12 +689,14 @@ def select_diversity(
 def select_species_enrichment(
     df: pl.DataFrame,
     rng: np.random.Generator,
-    existing_clip_ids: Set[str]
+    existing_clip_ids: Set[str],
+    use_embeddings: bool = True
 ) -> pl.DataFrame:
     """
     Select 900 proxy species-enriched training clips.
     
     For top 60 species, select 15 clips per species using farthest-first traversal.
+    If use_embeddings=False, uses random selection instead.
     """
     logger.info("Selecting species-enriched training clips...")
     
@@ -687,11 +746,52 @@ def select_species_enrichment(
         candidates = species_df.sort("species_score", descending=True).head(SPECIES_CANDIDATE_POOL_SIZE)
         logger.info(f"Species '{species}': {len(candidates)} candidates")
         
-        # Load embeddings for candidates
-        embeddings = load_embeddings_for_clips(candidates)
+        # Decide whether to use embeddings
+        use_fft = use_embeddings and len(candidates) >= CLIPS_PER_SPECIES
         
-        if len(embeddings) < CLIPS_PER_SPECIES:
-            # Not enough embeddings, use available with constraints
+        if use_fft:
+            try:
+                # Load embeddings for candidates
+                embeddings = load_embeddings_for_clips(candidates, max_files=10, sample_per_file=200)
+                
+                if len(embeddings) < CLIPS_PER_SPECIES:
+                    logger.warning(f"Only {len(embeddings)} embeddings for species '{species}', using random selection")
+                    use_fft = False
+                else:
+                    # Farthest-first traversal
+                    clip_ids = candidates.select("clip_id").to_series().to_list()
+                    fft_ids = farthest_first_traversal(embeddings, clip_ids, CLIPS_PER_SPECIES * 3, rng=rng)
+                    
+                    # Filter through constraints
+                    fft_df = candidates.filter(pl.col("clip_id").is_in(fft_ids))
+                    selected = filter_with_constraints(
+                        fft_df,
+                        CLIPS_PER_SPECIES,
+                        rng,
+                        existing_minute_keys,
+                        existing_site_day_times,
+                        max_per_site=MAX_CLIPS_PER_SITE_SPECIES
+                    )
+                    
+                    # Supplement if needed
+                    if len(selected) < CLIPS_PER_SPECIES:
+                        remaining = candidates.filter(~pl.col("clip_id").is_in(selected["clip_id"]))
+                        supplement = filter_with_constraints(
+                            remaining,
+                            CLIPS_PER_SPECIES - len(selected),
+                            rng,
+                            existing_minute_keys,
+                            existing_site_day_times,
+                            max_per_site=MAX_CLIPS_PER_SITE_SPECIES
+                        )
+                        if not supplement.is_empty():
+                            selected = pl.concat([selected, supplement])
+            except Exception as e:
+                logger.warning(f"FFT selection failed for '{species}': {e}. Using random selection.")
+                use_fft = False
+        
+        if not use_fft:
+            # Random selection with constraints
             selected = filter_with_constraints(
                 candidates,
                 CLIPS_PER_SPECIES,
@@ -700,35 +800,6 @@ def select_species_enrichment(
                 existing_site_day_times,
                 max_per_site=MAX_CLIPS_PER_SITE_SPECIES
             )
-        else:
-            # Farthest-first traversal
-            clip_ids = candidates.select("clip_id").to_series().to_list()
-            fft_ids = farthest_first_traversal(embeddings, clip_ids, CLIPS_PER_SPECIES * 3, rng=rng)
-            
-            # Filter through constraints
-            fft_df = candidates.filter(pl.col("clip_id").is_in(fft_ids))
-            selected = filter_with_constraints(
-                fft_df,
-                CLIPS_PER_SPECIES,
-                rng,
-                existing_minute_keys,
-                existing_site_day_times,
-                max_per_site=MAX_CLIPS_PER_SITE_SPECIES
-            )
-            
-            # Supplement if needed
-            if len(selected) < CLIPS_PER_SPECIES:
-                remaining = candidates.filter(~pl.col("clip_id").is_in(selected["clip_id"]))
-                supplement = filter_with_constraints(
-                    remaining,
-                    CLIPS_PER_SPECIES - len(selected),
-                    rng,
-                    existing_minute_keys,
-                    existing_site_day_times,
-                    max_per_site=MAX_CLIPS_PER_SITE_SPECIES
-                )
-                if not supplement.is_empty():
-                    selected = pl.concat([selected, supplement])
         
         # Update tracking
         for row in selected.iter_rows(named=True):
@@ -953,6 +1024,11 @@ def main():
         default=RANDOM_SEED,
         help=f"Random seed for reproducibility (default: {RANDOM_SEED}).",
     )
+    parser.add_argument(
+        "--skip-embeddings",
+        action="store_true",
+        help="Skip embedding-based selection (k-means, farthest-first). Use random selection instead. Much faster.",
+    )
     args = parser.parse_args()
     
     # Initialize RNG
@@ -968,6 +1044,10 @@ def main():
     logger.info(f"Months: {sorted(df.select('month').unique().to_series().to_list())}")
     logger.info(f"Clips with embeddings: {df.filter(pl.col('embedding_exists')).height}")
     logger.info(f"Clips with audio files: {df.filter(pl.col('file_exists')).height}")
+    
+    use_embeddings = not args.skip_embeddings
+    if args.skip_embeddings:
+        logger.info("Skipping embedding-based selection (--skip-embeddings flag set)")
     
     # 1. Spatial test split
     spatial_test_df = select_spatial_test(df, rng)
@@ -989,8 +1069,21 @@ def main():
     
     # 4. Diversity sampling
     existing_ids = spatial_test_ids | temporal_test_ids
-    diversity_df = select_diversity(eligible_df, rng, existing_ids)
-    diversity_ids = set(diversity_df["clip_id"].to_list())
+    diversity_df = select_diversity(eligible_df, rng, existing_ids, use_embeddings=use_embeddings)
+    if diversity_df.is_empty():
+        logger.error("Diversity selection returned no clips!")
+        diversity_ids = set()
+    else:
+        diversity_ids = set(diversity_df["clip_id"].to_list())
+    
+    # 5. Species enrichment
+    existing_ids = spatial_test_ids | temporal_test_ids | diversity_ids
+    species_df = select_species_enrichment(eligible_df, rng, existing_ids, use_embeddings=use_embeddings)
+    if species_df.is_empty():
+        logger.error("Species enrichment selection returned no clips!")
+        species_enrichment_ids = set()
+    else:
+        species_enrichment_ids = set(species_df["clip_id"].to_list())
     
     # 5. Species enrichment
     existing_ids = spatial_test_ids | temporal_test_ids | diversity_ids
