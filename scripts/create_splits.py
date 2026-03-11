@@ -12,7 +12,7 @@ This script:
 7. Adds split labels and saves the annotated index
 
 Usage:
-    python create_splits.py --input canonical_index.parquet --output master_clip_index_with_splits.parquet
+    python create_splits.py --input canonical_index.parquet --output master_clip_index_with_splits.parquet --seed 42
 """
 
 import argparse
